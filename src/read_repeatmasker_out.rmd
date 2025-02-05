@@ -1,0 +1,428 @@
+---
+title: "read_repeatmasker_out"
+author: "Kevin Stachelek"
+date: "3/26/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_libraries, options}
+
+
+suppressMessages(library(tidyr))
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggridges))
+suppressMessages(library(ggrepel))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(data.table))
+suppressMessages(library(broom))
+suppressMessages(library(ROCR))
+# library(pamr)
+
+#' inherit dplyr::filter
+#' @param min minimal group size, use \code{min = NULL} to filter on maximal group size only
+#' @param max maximal group size, use \code{max = NULL} to filter on minimal group size only
+#' @export
+#' @source Stack Overflow answer by docendo discimus, \url{https://stackoverflow.com/a/43110620/4575331}
+filter_group_size <- function(.data, min = NULL, max = min) {
+  g <- dplyr::group_size(.data)
+  if (is.null(min) & is.null(max)) {
+    stop('`min` and `max` cannot both be NULL.')
+  }
+  if (is.null(max)) {
+    max <- base::max(g, na.rm = TRUE)
+  }
+  ind <- base::rep(g >= min & g <= max, g)
+  .data[ind, ]
+}
+
+full_join_NA <- function(x, y, ...) {
+  full_join(x = x, y = y, by = ...) %>% 
+    mutate_all(funs(replace(., which(is.na(.)), 0)))
+}
+
+right_join_NA <- function(x, y, ...) {
+  dplyr::right_join(x = x, y = y, by = ...) %>% 
+    mutate_all(funs(replace(., which(is.na(.)), 0)))
+}
+
+n_fun <- function(x){
+  return(data.frame(y = median(x), label = paste0("n = ",length(x))))
+}
+```
+
+
+
+```{r load_files, options}
+
+repeatmask_out_files = list.files("~/os_exosome_pipeline/output/repeatmasker/", full.names = TRUE, pattern = ".*.trimmed.fasta.out$")
+# remove sample HRC-4 (possible outlier rb sibling control)
+# repeatmask_out_files = repeatmask_out_files[-4]
+
+rmask_summs <- lapply(repeatmask_out_files, function(x)read.table(x, header = FALSE, skip =2, sep = "", stringsAsFactors = FALSE, fill=TRUE))
+names(rmask_summs) <- gsub(".*//|_S.*", "", repeatmask_out_files)
+
+genome_sizes <- read.table("~/os_exosome_pipeline/results/prinseq_sequence_size.csv", sep = ",", header = FALSE)
+colnames(genome_sizes) <- c("sample", "genome_size")
+
+#repeatmask_out <- read.table(repeatmask_out_file, header = FALSE, skip =2, sep = "", stringsAsFactors = FALSE, fill=TRUE)
+
+rep_mask_colnames <- c("SW_score", "perc_div.", "perc_del.", "perc_ind.", "query_sequence", "query_begin", 
+                             "query_end", "query_left", "num_comp","matching_repeat", "repeat_class_family", "repeat_begin", 
+                             "repeat_end", "repeat_left", "ID")
+rmask_summs <- lapply(rmask_summs, setNames, rep_mask_colnames)
+
+tidy_rmask <- rmask_summs %>%
+  bind_rows(.id="sample") %>%
+  mutate(Size = query_end - query_begin) %>%
+  mutate(disease_group = ifelse(grepl("OS", sample), "OS","ctrl")) %>%
+  left_join(genome_sizes, by = "sample")
+
+```
+
+
+```{r box_plot_linel1, options}
+# continue visualliztion --------------------------------------------------
+
+sample_by_group <- unique(tidy_rmask[c("sample", "disease_group")])
+
+zero_template <- expand.grid("sample" = unique(tidy_rmask$sample), "matching_repeat" = unique(tidy_rmask$matching_repeat), "repeat_class_family" = unique(tidy_rmask$repeat_class_family), "disease_group" = unique(tidy_rmask$disease_group)) 
+
+strip_plot.grouped <- tidy_rmask %>%
+  group_by(disease_group, sample, genome_size, repeat_class_family, matching_repeat) %>%
+  summarise(Count = n(), Size = sum(Size)) %>%
+  mutate(genome_proportion = Size/genome_size, 
+         sample_by_group = paste(sample, disease_group, sep="_"),
+         sample_by_family = paste(sample, repeat_class_family, sep="_"),
+         sample_by_repeat = paste(sample, matching_repeat, sep="")) %>% 
+  filter(repeat_class_family == "LINE/L1")
+
+strip_plot.grouped <- split(strip_plot.grouped, strip_plot.grouped$matching_repeat)
+
+
+# test <- lapply(strip_plot.grouped, function(x) {t.test(genome_proportion ~ disease_group, data = x)})
+
+outlier_reps <- c("L1P1", "L1PB", "L1P3", "L1PREC2", "L1M1", "L1P2", "L1P4", "L1M2", "L1M4")
+  
+line_df <- tidy_rmask %>%
+  group_by(disease_group, sample, genome_size, repeat_class_family, matching_repeat) %>%
+  summarise(Count = n(), Size = sum(Size)) %>%
+  filter(repeat_class_family == "LINE/L1") %>%
+  mutate(genome_proportion = Size/genome_size, 
+         sample_by_group = paste(sample, disease_group, sep="_"),
+         sample_by_family = paste(sample, repeat_class_family, sep="_"),
+         sample_by_repeat = paste(sample, matching_repeat, sep="")) %>% 
+  group_by(matching_repeat, disease_group) %>% 
+  mutate(name_poor = case_when(
+    sample == "13-HRC4-chla" & matching_repeat %in% outlier_reps ~ sample))
+
+num_per_rep <- data.frame(table(line_df$matching_repeat, line_df$disease_group)) %>% 
+  filter(Freq > 1) %>% 
+  group_by(Var1)
+
+num_shared <- data.frame(table(num_per_rep$Var1)) %>% 
+  filter(Freq > 1) %>% 
+  .$Var1
+
+t_test_lines <- filter(line_df, matching_repeat %in% num_shared)
+
+write.csv(t_test_lines, "~/os_exosome_pipeline/results/with_hrc4/t_test_lines.csv")
+
+p_val <- t_test_lines %>% 
+  group_by(matching_repeat) %>% 
+  do(broom::tidy(t.test(genome_proportion ~ disease_group, data = ., var.equal = FALSE))) %>% 
+  filter(p.value < 0.05) %>% 
+  filter(abs(estimate2) > 8e-05) %>% 
+  mutate(fold_change = (estimate2/estimate1), log2fc = log2(fold_change))
+
+write.csv(p_val, "~/os_exosome_pipeline/results/with_hrc4/p_val_line_elements.csv")
+
+line_df <- line_df[line_df$matching_repeat %in% p_val$matching_repeat,]
+# 
+# joy_plot_linel1 <- ggplot(strip_plot.pooled, aes(x=genome_proportion, y=reorder(matching_repeat, genome_proportion), fill=disease_group)) + 
+#   geom_density_ridges() +
+#   theme(axis.text.y = element_text(size=5, angle = 45, vjust = 1, hjust=1))
+
+box_plot_linel1 <- ggplot(line_df, aes(x=reorder(matching_repeat, genome_proportion), y=genome_proportion, fill=disease_group)) + 
+  geom_boxplot(outlier.colour = "red", outlier.shape = 1, outlier.size = 0.5) +
+  theme(axis.text.x = element_text(size=5, angle = 90, vjust = 1, hjust=1)) +
+  labs(y = "Genome Proportion", x = "LINE/L1 Repeat") + 
+  geom_text_repel(aes(label = name_poor), size = 1, color = "red")
+  
+ggsave("~/os_exosome_pipeline/results/with_hrc4/box_plot_line_l1_top_fold_change.png")
+
+
+```
+
+```{r box_plot_sinealu, options}
+# continue visualliztion --------------------------------------------------
+
+sample_by_group <- unique(tidy_rmask[c("sample", "disease_group")])
+
+zero_template <- expand.grid("sample" = unique(tidy_rmask$sample), "matching_repeat" = unique(tidy_rmask$matching_repeat), "repeat_class_family" = unique(tidy_rmask$repeat_class_family), "disease_group" = unique(tidy_rmask$disease_group)) 
+
+strip_plot.grouped <- tidy_rmask %>%
+  group_by(disease_group, sample, genome_size, repeat_class_family, matching_repeat) %>%
+  summarise(Count = n(), Size = sum(Size)) %>%
+  mutate(genome_proportion = Size/genome_size, 
+         sample_by_group = paste(sample, disease_group, sep="_"),
+         sample_by_family = paste(sample, repeat_class_family, sep="_"),
+         sample_by_repeat = paste(sample, matching_repeat, sep="")) %>% 
+  # filter(repeat_class_family == "SINE/Alu") %>% 
+	identity()
+
+strip_plot.grouped <- split(strip_plot.grouped, strip_plot.grouped$matching_repeat)
+
+
+# test <- lapply(strip_plot.grouped, function(x) {t.test(genome_proportion ~ disease_group, data = x)})
+
+outlier_reps <- c("Alu", "AluSp", "AluSz", "AluSqz", "AluSq2", "AluJo", "AluJb", "AluSx", "AluSz6")
+  
+sine_df <- tidy_rmask %>%
+  group_by(disease_group, sample, genome_size, repeat_class_family, matching_repeat) %>%
+  summarise(Count = n(), Size = sum(Size)) %>%
+  filter(repeat_class_family == "SINE/Alu") %>%
+  mutate(genome_proportion = Size/genome_size, 
+         sample_by_group = paste(sample, disease_group, sep="_"),
+         sample_by_family = paste(sample, repeat_class_family, sep="_"),
+         sample_by_repeat = paste(sample, matching_repeat, sep="")) %>% 
+  group_by(matching_repeat, disease_group) %>% 
+  mutate(name_poor = case_when(
+    sample == "13-HRC4-chla" & matching_repeat %in% outlier_reps ~ sample))
+
+num_per_rep <- data.frame(table(sine_df$matching_repeat, sine_df$disease_group)) %>% 
+  filter(Freq > 1) %>% 
+  group_by(Var1)
+
+num_shared <- data.frame(table(num_per_rep$Var1)) %>% 
+  filter(Freq > 1) %>% 
+  .$Var1
+
+t_test_sines <- filter(sine_df, matching_repeat %in% num_shared)
+
+p_val <- t_test_sines %>% 
+  group_by(matching_repeat) %>% 
+  do(tidy(t.test(genome_proportion ~ disease_group, data = ., var.equal = FALSE))) %>% 
+  filter(p.value < 0.05) %>% 
+  filter(abs(estimate2) > 8e-05) %>% 
+  mutate(fold_change = (estimate2/estimate1), log2fc = log2(estimate2/estimate1))
+
+write.csv(p_val, "~/os_exosome_pipeline/results/with_hrc4/p_val_sine_alu_elements.csv")
+
+sine_df <- sine_df[sine_df$matching_repeat %in% p_val$matching_repeat,]
+# 
+# joy_plot_linel1 <- ggplot(strip_plot.pooled, aes(x=genome_proportion, y=reorder(matching_repeat, genome_proportion), fill=disease_group)) + 
+#   geom_density_ridges() +
+#   theme(axis.text.y = element_text(size=5, angle = 45, vjust = 1, hjust=1))
+
+box_plot_linel1 <- ggplot(sine_df, aes(x=reorder(matching_repeat, genome_proportion), y=genome_proportion, fill=disease_group)) + 
+  geom_boxplot(outlier.colour = "red", outlier.shape = 1, outlier.size = 0.5) +
+  theme(axis.text.x = element_text(size=5, angle = 90, vjust = 1, hjust=1)) +
+  labs(y = "Genome Proportion", x = "LINE/L1 Repeat") +
+  geom_text_repel(aes(label = name_poor), size = 1, color = "red")
+
+
+  
+ggsave("~/os_exosome_pipeline/results/with_hrc4/box_plot_sine_alu_top_fold_change.png")
+
+
+```
+
+```{r 4, }
+
+# find 'housekeeping' repetitive element, exhibiting high and uniform expression despite disease_group
+
+hk_in <- strip_plot.grouped %>% 
+	group_by(disease_group, repeat_class_family, matching_repeat) %>% 
+	summarize(values = list(genome_proportion)) %>% 
+	group_by(disease_group, matching_repeat) %>% 
+	tidyr::spread(disease_group, values) %>% 
+	filter(!is.null(unlist(OS))) %>% 
+	filter(!is.null(unlist(ctrl))) %>% 
+	filter(length(unlist(ctrl)) > 1) %>% 
+	filter(length(unlist(OS)) > 1) %>% 
+	filter(!any(is.na(unlist(ctrl)))) %>% 
+	filter(!any(is.na(unlist(OS)))) %>% 
+	mutate(p_value = equivalence::tost(unlist(OS), unlist(ctrl))$tost.p.value) %>%
+	mutate(OS_prop = equivalence::tost(unlist(OS), unlist(ctrl))$estimate[[1]]) %>%
+	mutate(ctrl_prop = equivalence::tost(unlist(OS), unlist(ctrl))$estimate[[2]]) %>%
+	mutate(FC = OS_prop/ctrl_prop) %>% 
+	arrange(desc(OS_prop)) %>% 
+	dplyr::select(-c(ctrl, OS)) %>% 
+	identity()	
+
+write.csv(hk_in, "~/os_exosome_pipeline/results/houskeeping_repetitive_elements.csv")
+
+```
+
+```{r tost, }
+
+head(hk_in)
+
+tost_res <- purrr::map(hk_in, function(x) equivalence::tost(x[["ctrl"]], x[["os"]]))
+
+tidy_tost <- function(hk_in, name){
+	feature = name
+	mean.x = tost_out$estimate[1]
+	mean.y = tost_out$estimate[2]
+	df <- tost_out$parameter
+	tost.p.value <- tost_out$tost.p.value
+	result <- tost_out$result
+	
+	return(list("feature" = feature, "mean.x" = mean.x, "mean.y" = mean.y, "df" = df, "p.value" = tost.p.value, "result" = result))
+	
+}
+
+tost_df <- purrr::map2_df(hk_in, names(tost_res), tidy_tost) %>% 
+	dplyr::arrange(desc(mean.y)) %>% 
+	# dplyr::filter(result == "rejected") %>% 
+	identity()
+```
+
+```{r strip_plot, echo=FALSE}
+
+outlier_reps <- c("LINE/L1", "SINE/Alu", "L1P3")
+
+strip_plot_zeroes <- tidy_rmask %>%
+  group_by(disease_group, sample, genome_size, repeat_class_family) %>%
+  summarise(Count = n(), Size = sum(Size)) %>%
+  mutate(genome_proportion = Size/genome_size, 
+         sample_by_group = paste(sample, disease_group, sep="_"),
+         sample_by_family = paste(sample, repeat_class_family, sep="_")) %>% 
+    mutate(name_poor = case_when(
+    sample == "13-HRC4-chla" & repeat_class_family %in% outlier_reps ~ sample))
+
+colourCount = unique(strip_plot_zeroes$sample_by_group)
+colourLength = length(colourCount)
+shapeCount = c(rep(16, 12), rep(17, 12))
+shapeCount <- gsub(".*OS.*", "OS", gsub(".*ctrl", "ctrl", colourCount))
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+
+strip_plot.zeros <- ggplot(strip_plot_zeroes, aes(x=genome_proportion, y=disease_group)) +  
+  geom_point(aes(shape=disease_group, color=factor(sample_by_group), group = disease_group), size = 1) + facet_wrap(~repeat_class_family, ncol =1, strip.position = "left") + 
+  theme(text = element_text(size=6), axis.text.y=element_blank(), axis.ticks.y=element_blank(), strip.text.y = element_text(angle=180), strip.text.x = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.25), strip.background = element_rect(color = "black", size = 0.25), 
+        panel.spacing = unit(0, "lines")) +
+  scale_color_hue(l=60, c=65) +
+  labs(x = "Genome Proportion", y = "Repeat Family", color = "Sample") +
+  geom_text(aes(label = name_poor), size = 1)
+print(strip_plot.zeros)
+
+
+ggsave("~/os_exosome_pipeline/results/with_hrc4/strip_plot_pooled.png")
+
+# strip_plot_pooled <- ggplot(strip_plot.pooled, aes(x=reorder(matching_repeat, genome_proportion), y=genome_proportion, fill=disease_group)) + 
+#   geom_bar(stat = "identity") +
+#   theme(axis.text.x = element_text(size=5, angle = 45, vjust = 1, hjust=1))
+
+```
+
+```{r line_roc, echo=FALSE}
+zero_template <- expand.grid("sample" = unique(line_df$sample), "matching_repeat" = unique(line_df$matching_repeat)) %>% 
+  mutate(sample_by_repeat = paste0(sample, matching_repeat)) %>% 
+  mutate(genome_proportion = 0.00) %>% 
+  mutate(disease_group = ifelse(grepl("OS", sample), "OS","ctrl")) %>%
+  filter(!is.na(sample))
+
+missed_samples <- anti_join(zero_template, line_df, by = c("sample_by_repeat")) %>% 
+  .$sample_by_repeat
+
+missed_zeros <- zero_template[zero_template$sample_by_repeat %in% missed_samples,]
+
+line_df_zero <- full_join(line_df, missed_zeros, by =  c("sample", "sample_by_repeat", "matching_repeat", "genome_proportion", "disease_group"))
+
+predictions <- split(line_df_zero, line_df_zero$matching_repeat)
+
+genom_prop <- lapply(predictions, "[", c("disease_group", "sample", "genome_proportion"))
+
+line_proportions <- dplyr::bind_rows(genom_prop, .id = "matching_repeat") %>% 
+  spread(matching_repeat, genome_proportion)
+
+make_pred <- function(repeat_df, repeat_name){
+  pred <- prediction(repeat_df$genome_proportion, repeat_df$disease_group)
+  perf <- performance(pred, measure = "tpr", x.measure = "fpr") 
+  auc_ROCR <- performance(pred, measure = "auc")
+  plot(perf, col=rainbow(10), main = paste0(repeat_name, " AUC: ", auc_ROCR@y.values))
+  
+  auc_list <- setNames(c(repeat_name, auc_ROCR@y.values), c("repeat_class", "area_under_curve"))
+  
+  return(auc_list)
+}
+
+pdf("~/os_exosome_pipeline/results/with_hrc4/os_exosome_line_area_under_curve.pdf")
+auc_data <- purrr::map2_df(genom_prop, names(genom_prop), make_pred)
+dev.off()
+
+write.csv(auc_data, "~/os_exosome_pipeline/results/with_hrc4/os_exosome_line_area_under_curve.csv")
+write.csv(line_proportions, "~/os_exosome_pipeline/results/with_hrc4/os_exosome_line_auc_input.csv")
+
+```
+
+```{r sine_roc, echo=FALSE}
+
+zero_template <- expand.grid("sample" = unique(sine_df$sample), "matching_repeat" = unique(sine_df$matching_repeat)) %>% 
+  mutate(sample_by_repeat = paste0(sample, matching_repeat)) %>% 
+  mutate(genome_proportion = 0.00) %>% 
+  mutate(disease_group = ifelse(grepl("OS", sample), "OS","ctrl")) %>%
+  filter(!is.na(sample))
+
+missed_samples <- anti_join(zero_template, sine_df, by = c("sample_by_repeat")) %>% 
+  .$sample_by_repeat
+
+missed_zeros <- zero_template[zero_template$sample_by_repeat %in% missed_samples,]
+
+sine_df_zero <- full_join(sine_df, missed_zeros, by =  c("sample", "sample_by_repeat", "matching_repeat", "genome_proportion", "disease_group"))
+
+predictions <- split(sine_df_zero, sine_df_zero$matching_repeat)
+
+genom_prop <- lapply(predictions, "[", c("disease_group", "sample", "genome_proportion"))
+
+sine_proportions <- dplyr::bind_rows(genom_prop, .id = "matching_repeat") %>% 
+  spread(matching_repeat, genome_proportion)
+
+make_pred <- function(repeat_df, repeat_name){
+
+  pred <- prediction(repeat_df$genome_proportion, repeat_df$disease_group)
+  perf <- performance(pred, measure = "tpr", x.measure = "fpr") 
+  auc_ROCR <- performance(pred, measure = "auc")
+  plot(perf, col=rainbow(10), main = paste0(repeat_name, " AUC: ", auc_ROCR@y.values))
+  auc_list <- setNames(c(repeat_name, auc_ROCR@y.values), c("repeat_class", "area_under_curve"))
+  
+  return(auc_list)
+}
+
+pdf("~/os_exosome_pipeline/results/with_hrc4/os_exosome_sine_area_under_curve.pdf")
+auc_data <- purrr::map2_df(genom_prop, names(genom_prop), make_pred)
+dev.off()
+write.csv(auc_data, "~/os_exosome_pipeline/results/with_hrc4/os_exosome_sine_area_under_curve.csv")
+write.csv(sine_proportions, "~/os_exosome_pipeline/results/with_hrc4/os_exosome_sine_auc_input.csv")
+
+```
+```{r igv_sample_info, echo=FALSE}
+
+strip_plot.grouped <- tidy_rmask %>%
+  group_by(disease_group, sample, genome_size, repeat_class_family, matching_repeat) %>%
+  summarise(Count = n(), Size = sum(Size)) %>%
+  mutate(genome_proportion = Size/genome_size, 
+         sample_by_group = paste(sample, disease_group, sep="_"),
+         sample_by_family = paste(sample, repeat_class_family, sep="_"),
+         sample_by_repeat = paste(sample, matching_repeat, sep="")) %>% 
+  filter(repeat_class_family == "LINE/L1")
+
+l1p1_order <- dplyr::filter(strip_plot.grouped, matching_repeat == "L1P1") %>% 
+  arrange(desc(genome_proportion)) %>% 
+  pull(sample)
+
+os_files <- list.files("~/os_exosome_pipeline/data/FASTQ/os_sorted_bams/", pattern="*.bam$")
+ctrl_files <- list.files("~/os_exosome_pipeline/data/FASTQ/ctrl_sorted_bams/", pattern="*.bam$")
+all_files <- c(os_files, ctrl_files)
+new_order <- pmatch(l1p1_order, all_files)
+all_files <- all_files[new_order]
+sample_info <- data.frame(Array = paste0(all_files, " Coverage"), Order = letters[1:length(all_files)])
+write.table(sample_info, "~/os_exosome_pipeline/data/FASTQ/igv_sample_info.txt", row.names = FALSE, sep= "\t", quote=FALSE)
+
+```
